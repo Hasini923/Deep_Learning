@@ -1,3 +1,4 @@
+### Experiment 3 – Convolutional Neural Network (CNN)
 Implemented and analyzed the basic components of a CNN and studied how different convolution hyperparameters affect feature maps.
 
 **Topics covered:**
