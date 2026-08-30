@@ -1,0 +1,436 @@
+# %% Task 0 - Setup and data pipelines
+!pip -q install -U importlib_resources protobuf tensorflow-datasets tensorflow-metadata
+
+import gc
+import time
+import numpy as np
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import matplotlib.pyplot as plt
+from tensorflow.keras import layers, models, optimizers, regularizers
+from sklearn.model_selection import KFold
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+
+tf.random.set_seed(42)
+np.random.seed(42)
+
+IMG_SIZE_SMALL = 160   # used for Tasks 1-5, 7 (many from-scratch training runs)
+IMG_SIZE_FULL = 224    # used for Tasks 6, 8 (transfer learning + final model)
+BATCH_SMALL = 16
+BATCH_FULL = 32
+NUM_CLASSES = 2  # Cat vs Dog
+
+TRAIN_SUBSET = 1200   # images used per training run in Tasks 1-5, 7
+VAL_SUBSET = 300       # images used per validation run in Tasks 1-5, 7
+
+(ds_train, ds_val, ds_test), ds_info = tfds.load(
+    "oxford_iiit_pet",
+    split=["train[:70%]", "train[70%:85%]", "train[85%:]"],
+    with_info=True,
+    as_supervised=False,
+)
+
+def make_preprocess(img_size):
+    def preprocess(example):
+        image = tf.image.resize(example["image"], (img_size, img_size))
+        image = tf.keras.applications.mobilenet_v2.preprocess_input(tf.cast(image, tf.float32))
+        return image, example["species"]  # species: 0 = Cat, 1 = Dog
+    return preprocess
+
+def make_pipeline(ds, img_size, shuffle=False, augment=False, batch_size=BATCH_SMALL):
+    ds = ds.map(make_preprocess(img_size), num_parallel_calls=tf.data.AUTOTUNE)
+    if shuffle:
+        ds = ds.shuffle(1000)
+    if augment:
+        aug = tf.keras.Sequential([layers.RandomFlip("horizontal"), layers.RandomRotation(0.05)])
+        ds = ds.map(lambda x, y: (aug(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+# Light pipeline (160x160, batch 16, SUBSET of data) - Tasks 1-5, 7
+train_ds_s = make_pipeline(ds_train.take(TRAIN_SUBSET), IMG_SIZE_SMALL, shuffle=True, augment=True, batch_size=BATCH_SMALL)
+val_ds_s = make_pipeline(ds_val.take(VAL_SUBSET), IMG_SIZE_SMALL, batch_size=BATCH_SMALL)
+
+# Full-resolution pipeline (224x224, batch 32) - Tasks 6, 8
+train_ds_f = make_pipeline(ds_train, IMG_SIZE_FULL, shuffle=True, augment=True, batch_size=BATCH_FULL)
+val_ds_f = make_pipeline(ds_val, IMG_SIZE_FULL, batch_size=BATCH_FULL)
+test_ds_f = make_pipeline(ds_test, IMG_SIZE_FULL, batch_size=BATCH_FULL)
+
+def build_model(initializer, img_size, dropout=0.0, l2_reg=0.0, use_bn=True, weights=None):
+    reg = regularizers.l2(l2_reg) if l2_reg > 0 else None
+    base = tf.keras.applications.MobileNetV2(
+        input_shape=(img_size, img_size, 3), include_top=False, weights=weights, pooling="avg"
+    )
+    x = base.output
+    if use_bn:
+        x = layers.BatchNormalization()(x)
+    if dropout > 0:
+        x = layers.Dropout(dropout)(x)
+    out = layers.Dense(NUM_CLASSES, activation="softmax", kernel_initializer=initializer, kernel_regularizer=reg)(x)
+    return base, models.Model(base.input, out)
+
+def free_memory(*objs):
+    """Delete given objects, clear the Keras backend graph, and force a GC pass.
+    Call this after every model you finish training in a loop."""
+    for o in objs:
+        del o
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+print("Data pipelines ready:", ds_info.splits)
+print(f"Tasks 1-5, 7 use a {TRAIN_SUBSET}-train/{VAL_SUBSET}-val subset at {IMG_SIZE_SMALL}x{IMG_SIZE_SMALL}")
+print(f"Tasks 6, 8 use the full dataset at {IMG_SIZE_FULL}x{IMG_SIZE_FULL}")
+
+
+# %% Task 1 - Weight initialization (Plot 1, Plot 2)
+initializers_to_test = {
+    "zeros": tf.keras.initializers.Zeros(),
+    "random_normal": tf.keras.initializers.RandomNormal(stddev=0.05),
+    "xavier": tf.keras.initializers.GlorotUniform(),
+    "he": tf.keras.initializers.HeNormal(),
+}
+EPOCHS = 5
+init_history = {}
+
+for name, init in initializers_to_test.items():
+    print(f"Training with {name} initialization")
+    tf.keras.backend.clear_session()
+    _, model = build_model(init, IMG_SIZE_SMALL)
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    init_history[name] = model.fit(train_ds_s, validation_data=val_ds_s, epochs=EPOCHS, verbose=1).history
+    free_memory(model)
+
+plt.figure(figsize=(6, 4))
+for name, h in init_history.items():
+    plt.plot(h["loss"], label=name)
+plt.xlabel("Epoch"); plt.ylabel("Training Loss")
+plt.title("Plot 1: Training Loss vs Epoch (Initialization)")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+plt.figure(figsize=(6, 4))
+for name, h in init_history.items():
+    plt.plot([a * 100 for a in h["val_accuracy"]], label=name)
+plt.xlabel("Epoch"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 2: Validation Accuracy vs Epoch (Initialization)")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+
+# %% Task 2 - Regularization and overfitting (Plot 3, Plot 4)
+reg_configs = {
+    "no_regularization": dict(dropout=0.0, l2_reg=0.0, use_bn=False),
+    "l2": dict(dropout=0.0, l2_reg=1e-3, use_bn=False),
+    "dropout": dict(dropout=0.5, l2_reg=0.0, use_bn=False),
+    "batch_norm": dict(dropout=0.0, l2_reg=0.0, use_bn=True),
+}
+EPOCHS = 8
+reg_history = {}
+
+for name, cfg in reg_configs.items():
+    print(f"Training with {name}")
+    tf.keras.backend.clear_session()
+    _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, **cfg)
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    reg_history[name] = model.fit(train_ds_s, validation_data=val_ds_s, epochs=EPOCHS, verbose=1).history
+    free_memory(model)
+
+for name, h in reg_history.items():
+    plt.figure(figsize=(6, 4))
+    plt.plot([a * 100 for a in h["accuracy"]], label="Train Acc")
+    plt.plot([a * 100 for a in h["val_accuracy"]], label="Val Acc")
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy (%)")
+    plt.title(f"Plot 3: Train vs Val Accuracy - {name}")
+    plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(h["loss"], label="Train Loss")
+    plt.plot(h["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss")
+    plt.title(f"Plot 4: Train vs Val Loss - {name}")
+    plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+
+# %% Task 3 - Batch normalization: numerical example + Plot 5
+x = np.array([2.0, 4.0, 6.0, 8.0])
+mu, var, eps = x.mean(), x.var(), 1e-8
+x_hat = (x - mu) / np.sqrt(var + eps)
+gamma, beta = 1.0, 0.0
+y = gamma * x_hat + beta
+print("mu_B =", mu, " var_B =", var)
+print("x_hat =", x_hat)
+print("y =", y)
+
+EPOCHS = 8
+bn_history = {}
+for name, use_bn in {"With_BN": True, "Without_BN": False}.items():
+    print(f"Training {name}")
+    tf.keras.backend.clear_session()
+    _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, use_bn=use_bn)
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    bn_history[name] = model.fit(train_ds_s, validation_data=val_ds_s, epochs=EPOCHS, verbose=1).history
+    free_memory(model)
+
+plt.figure(figsize=(6, 4))
+for name, h in bn_history.items():
+    plt.plot([a * 100 for a in h["val_accuracy"]], label=name)
+plt.xlabel("Epoch"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 5: With vs Without Batch Normalization")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+
+# %% Task 4 - Optimizer comparison (Plot 6, Plot 7, summary table)
+optimizer_configs = {
+    "SGD": lambda: optimizers.SGD(learning_rate=0.01),
+    "Momentum": lambda: optimizers.SGD(learning_rate=0.01, momentum=0.9),
+    "RMSProp": lambda: optimizers.RMSprop(learning_rate=0.001),
+    "Adam": lambda: optimizers.Adam(learning_rate=0.001),
+}
+EPOCHS = 8
+opt_history, opt_summary = {}, []
+
+for name, opt_fn in optimizer_configs.items():
+    print(f"Training with {name}")
+    tf.keras.backend.clear_session()
+    _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, use_bn=True)
+    model.compile(optimizer=opt_fn(), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    t0 = time.time()
+    hist = model.fit(train_ds_s, validation_data=val_ds_s, epochs=EPOCHS, verbose=1).history
+    elapsed = time.time() - t0
+    opt_history[name] = hist
+    best_acc = max(hist["val_accuracy"]) * 100
+    converge_epoch = int(np.argmax(hist["val_accuracy"]) + 1)
+    opt_summary.append([name, hist["loss"][-1], best_acc, converge_epoch, round(elapsed, 1)])
+    free_memory(model)
+
+plt.figure(figsize=(6, 4))
+for name, h in opt_history.items():
+    plt.plot(h["loss"], label=name)
+plt.xlabel("Epoch"); plt.ylabel("Training Loss")
+plt.title("Plot 6: Training Loss vs Epoch (Optimizers)")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+plt.figure(figsize=(6, 4))
+for name, h in opt_history.items():
+    plt.plot([a * 100 for a in h["val_accuracy"]], label=name)
+plt.xlabel("Epoch"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 7: Validation Accuracy vs Epoch (Optimizers)")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+print("\nOptimizer | Final Loss | Best Val Acc (%) | Epoch to Converge | Time (s)")
+for row in opt_summary:
+    print(row)
+
+
+# %% Task 5 - Hyperparameter tuning: LR, batch size, dropout (Plot 8, 9, 10)
+BASE_LR, BASE_DROPOUT = 0.001, 0.25
+EPOCHS = 6
+
+lr_results = {}
+for lr in [0.001, 0.0001]:
+    tf.keras.backend.clear_session()
+    _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, dropout=BASE_DROPOUT, use_bn=True)
+    model.compile(optimizer=optimizers.Adam(learning_rate=lr), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    hist = model.fit(train_ds_s, validation_data=val_ds_s, epochs=EPOCHS, verbose=0).history
+    lr_results[lr] = max(hist["val_accuracy"]) * 100
+    print(f"LR={lr}: best val acc = {lr_results[lr]:.2f}%")
+    free_memory(model)
+
+plt.figure(figsize=(6, 4))
+plt.plot(list(lr_results.keys()), list(lr_results.values()), "o-")
+plt.xscale("log")
+plt.xlabel("Learning Rate"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 8: Learning Rate vs Validation Accuracy")
+plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+bs_results = {}
+for bs in [16, 32, 64]:
+    tds = make_pipeline(ds_train.take(TRAIN_SUBSET), IMG_SIZE_SMALL, shuffle=True, augment=True, batch_size=bs)
+    vds = make_pipeline(ds_val.take(VAL_SUBSET), IMG_SIZE_SMALL, batch_size=bs)
+    tf.keras.backend.clear_session()
+    _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, dropout=BASE_DROPOUT, use_bn=True)
+    model.compile(optimizer=optimizers.Adam(learning_rate=BASE_LR), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    hist = model.fit(tds, validation_data=vds, epochs=EPOCHS, verbose=0).history
+    bs_results[bs] = max(hist["val_accuracy"]) * 100
+    print(f"Batch size={bs}: best val acc = {bs_results[bs]:.2f}%")
+    free_memory(model, tds, vds)
+
+plt.figure(figsize=(6, 4))
+plt.plot(list(bs_results.keys()), list(bs_results.values()), "o-")
+plt.xlabel("Batch Size"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 9: Batch Size vs Validation Accuracy")
+plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+dropout_results = {}
+for dr in [0.0, 0.25, 0.5]:
+    tf.keras.backend.clear_session()
+    _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, dropout=dr, use_bn=True)
+    model.compile(optimizer=optimizers.Adam(learning_rate=BASE_LR), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    hist = model.fit(train_ds_s, validation_data=val_ds_s, epochs=EPOCHS, verbose=0).history
+    dropout_results[dr] = max(hist["val_accuracy"]) * 100
+    print(f"Dropout={dr}: best val acc = {dropout_results[dr]:.2f}%")
+    free_memory(model)
+
+plt.figure(figsize=(6, 4))
+plt.plot(list(dropout_results.keys()), list(dropout_results.values()), "o-")
+plt.xlabel("Dropout Rate"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 10: Dropout Rate vs Validation Accuracy")
+plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+
+# %% Task 6 - Transfer learning vs fine-tuning (Plot 11, Plot 12) - full 224x224
+EPOCHS = 8
+
+tf.keras.backend.clear_session()
+base, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_FULL, dropout=0.3, use_bn=False, weights="imagenet")
+
+base.trainable = False
+model.compile(optimizer=optimizers.Adam(learning_rate=1e-3), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+hist_fe = model.fit(train_ds_f, validation_data=val_ds_f, epochs=EPOCHS, verbose=1).history
+
+base.trainable = True
+for layer in base.layers[:-30]:
+    layer.trainable = False
+model.compile(optimizer=optimizers.Adam(learning_rate=1e-5), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+hist_ft = model.fit(train_ds_f, validation_data=val_ds_f, epochs=EPOCHS, verbose=1).history
+
+plt.figure(figsize=(6, 4))
+fe_acc = [a * 100 for a in hist_fe["val_accuracy"]]
+ft_acc = [a * 100 for a in hist_ft["val_accuracy"]]
+plt.plot(range(1, len(fe_acc) + 1), fe_acc, label="Feature Extraction")
+plt.plot(range(len(fe_acc) + 1, len(fe_acc) + len(ft_acc) + 1), ft_acc, label="Fine-Tuning")
+plt.xlabel("Epoch"); plt.ylabel("Validation Accuracy (%)")
+plt.title("Plot 11: Feature Extraction vs Fine-Tuning")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+plt.figure(figsize=(6, 4))
+plt.plot(hist_fe["loss"] + hist_ft["loss"], label="Train Loss")
+plt.plot(hist_fe["val_loss"] + hist_ft["val_loss"], label="Val Loss")
+plt.axvline(x=len(hist_fe["loss"]) - 0.5, color="gray", linestyle="--", label="FE -> FT switch")
+plt.xlabel("Epoch"); plt.ylabel("Loss")
+plt.title("Plot 12: Training/Validation Loss (Feature Extraction -> Fine-Tuning)")
+plt.legend(); plt.grid(alpha=0.3); plt.show(); plt.close('all')
+
+free_memory(model, base)
+
+
+# %% Task 7 - 5-fold cross-validation for model selection (Plot 13) - light 160x160
+configs_for_cv = {
+    "C1_baseline": dict(lr=1e-3, dropout=0.0, use_bn=False),
+    "C2_best_reg": dict(lr=1e-3, dropout=0.5, use_bn=True),
+    "C3_best_optimizer": dict(lr=1e-3, dropout=0.25, use_bn=True),
+    "C4_best_hparams": dict(lr=1e-4, dropout=0.25, use_bn=True),
+}
+EPOCHS = 5
+CV_TRAIN_SUBSET = 700   # smaller than Tasks 1-5's subset - CV trains 20 models total (4 configs x 5 folds)
+CV_VAL_SUBSET = 150
+
+combined_ds = ds_train.take(CV_TRAIN_SUBSET).concatenate(ds_val.take(CV_VAL_SUBSET)).map(
+    make_preprocess(IMG_SIZE_SMALL), num_parallel_calls=tf.data.AUTOTUNE
+)
+X_all = np.stack([img.numpy() for img, _ in combined_ds])
+y_all = np.array([lbl.numpy() for _, lbl in combined_ds])
+del combined_ds
+gc.collect()
+
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_results = {name: [] for name in configs_for_cv}
+
+for name, cfg in configs_for_cv.items():
+    print(f"Cross-validating {name}")
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X_all), start=1):
+        tf.keras.backend.clear_session()
+        _, model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_SMALL, dropout=cfg["dropout"], use_bn=cfg["use_bn"])
+        model.compile(optimizer=optimizers.Adam(learning_rate=cfg["lr"]), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+        model.fit(X_all[train_idx], y_all[train_idx], validation_data=(X_all[val_idx], y_all[val_idx]),
+                   epochs=EPOCHS, batch_size=BATCH_SMALL, verbose=0)
+        _, acc = model.evaluate(X_all[val_idx], y_all[val_idx], verbose=0)
+        cv_results[name].append(acc * 100)
+        print(f"  Fold {fold}: val acc = {acc * 100:.2f}%")
+        free_memory(model)
+    gc.collect()  # extra sweep after each config's 5 folds
+
+print("\nConfig | F1 | F2 | F3 | F4 | F5 | Mean +/- SD")
+cv_summary = {}
+for name, accs in cv_results.items():
+    mean, sd = np.mean(accs), np.std(accs)
+    cv_summary[name] = (mean, sd)
+    print(f"{name}: {accs} -> {mean:.2f} +/- {sd:.2f}")
+
+plt.figure(figsize=(6, 4))
+names = list(cv_summary.keys())
+means = [cv_summary[n][0] for n in names]
+sds = [cv_summary[n][1] for n in names]
+plt.bar(names, means, yerr=sds, capsize=5)
+plt.ylabel("Mean Validation Accuracy (%)")
+plt.title("Plot 13: 5-Fold Cross-Validation Accuracy")
+plt.xticks(rotation=15); plt.grid(alpha=0.3, axis="y"); plt.show(); plt.close('all')
+
+best_config_name = max(cv_summary, key=lambda n: cv_summary[n][0])
+print(f"\nBest configuration by mean CV accuracy: {best_config_name}")
+
+# X_all/y_all (160x160) no longer needed once CV is done - Task 8 retrains at 224x224 from the tf.data pipeline instead.
+free_memory(X_all, y_all)
+
+
+# %% Task 8 - Final model evaluation on the held-out test set (Plot 14, Plot 15) - full 224x224
+best_cfg = configs_for_cv[best_config_name]
+EPOCHS = 5
+
+# Retrain on full train+val at 224x224 using the tf.data pipeline (no large numpy array needed).
+combined_ds_f = ds_train.concatenate(ds_val)
+retrain_ds_f = make_pipeline(combined_ds_f, IMG_SIZE_FULL, shuffle=True, augment=True, batch_size=BATCH_FULL)
+
+tf.keras.backend.clear_session()
+_, final_model = build_model(tf.keras.initializers.HeNormal(), IMG_SIZE_FULL, dropout=best_cfg["dropout"], use_bn=best_cfg["use_bn"])
+final_model.compile(optimizer=optimizers.Adam(learning_rate=best_cfg["lr"]), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+
+t0 = time.time()
+final_model.fit(retrain_ds_f, epochs=EPOCHS, verbose=1)
+train_time = time.time() - t0
+
+y_true, y_pred, mis_samples = [], [], []  # mis_samples holds only mismatched images, capped at 6
+for imgs, lbls in test_ds_f:
+    preds = final_model.predict(imgs, verbose=0)
+    pred_labels = np.argmax(preds, axis=1)
+    lbls_np = lbls.numpy()
+    imgs_np = imgs.numpy()
+    y_true.extend(lbls_np)
+    y_pred.extend(pred_labels)
+    for i in range(len(lbls_np)):
+        if lbls_np[i] != pred_labels[i] and len(mis_samples) < 6:
+            mis_samples.append((imgs_np[i], lbls_np[i], pred_labels[i]))
+    del imgs_np  # don't keep the full batch of images around once mismatches are extracted
+
+test_acc = np.mean(np.array(y_true) == np.array(y_pred))
+precision = precision_score(y_true, y_pred, average="macro")
+recall = recall_score(y_true, y_pred, average="macro")
+f1 = f1_score(y_true, y_pred, average="macro")
+num_params = final_model.count_params()
+
+print(f"Mean CV Accuracy: {cv_summary[best_config_name][0]:.2f}")
+print(f"CV Standard Deviation: {cv_summary[best_config_name][1]:.2f}")
+print(f"Test Accuracy: {test_acc * 100:.2f}%")
+print(f"Precision: {precision:.3f} | Recall: {recall:.3f} | F1-score: {f1:.3f}")
+print(f"Training Time: {train_time:.1f}s | Parameters: {num_params:,}")
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(4.5, 4))
+plt.imshow(cm, cmap="Blues")
+plt.title("Plot 14: Confusion Matrix")
+plt.xlabel("Predicted"); plt.ylabel("Actual")
+plt.xticks([0, 1], ["Cat", "Dog"]); plt.yticks([0, 1], ["Cat", "Dog"])
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, cm[i, j], ha="center", va="center")
+plt.colorbar(); plt.show(); plt.close('all')
+
+if mis_samples:
+    plt.figure(figsize=(12, 4))
+    for k, (img, true_lbl, pred_lbl) in enumerate(mis_samples):
+        plt.subplot(1, len(mis_samples), k + 1)
+        img_display = np.clip((img + 1) / 2, 0, 1)  # undo MobileNetV2 preprocessing for display
+        plt.imshow(img_display)
+        plt.title(f"True:{true_lbl} Pred:{pred_lbl}", fontsize=8)
+        plt.axis("off")
+    plt.suptitle("Plot 15: Misclassified Images")
+    plt.show(); plt.close('all')
+
+free_memory(final_model)
