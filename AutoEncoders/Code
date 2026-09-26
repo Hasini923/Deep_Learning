@@ -1,0 +1,566 @@
+# Setup and Installation
+#Setup and Installation
+!pip -q install scikit-image
+
+import os, time, random
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models, Input, Model
+from tensorflow.keras import backend as K
+from skimage.metrics import structural_similarity as ssim_fn
+
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+random.seed(SEED)
+
+print("TensorFlow:", tf.__version__)
+print("GPU available:", tf.config.list_physical_devices('GPU'))
+
+
+# Task: 1. Load and Preprocess MNIST
+
+(x_train_full, y_train_full), (x_test_full, y_test_full) = tf.keras.datasets.mnist.load_data()
+
+N_TRAIN, N_TEST = 10000, 2000
+rng = np.random.RandomState(SEED)
+
+train_idx = rng.permutation(len(x_train_full))[:N_TRAIN]
+test_idx = rng.permutation(len(x_test_full))[:N_TEST]
+
+x_train = x_train_full[train_idx].astype("float32") / 255.0
+y_train = y_train_full[train_idx]
+x_test = x_test_full[test_idx].astype("float32") / 255.0
+y_test = y_test_full[test_idx]
+
+# Channel dimension for conv models
+x_train_c = x_train[..., np.newaxis]  # (N, 28, 28, 1)
+x_test_c = x_test[..., np.newaxis]
+
+# Flattened version for the fully connected AE
+x_train_f = x_train.reshape(-1, 784)
+x_test_f = x_test.reshape(-1, 784)
+
+print("x_train:", x_train_c.shape, " x_test:", x_test_c.shape)
+print("x_train flattened:", x_train_f.shape, " x_test flattened:", x_test_f.shape)
+print("Pixel range:", x_train.min(), "-", x_train.max())
+
+
+# Task: 2. Fully connected autoencoder (build)
+
+LATENT_DIM_FC = 16
+
+def build_fc_autoencoder(latent_dim=LATENT_DIM_FC):
+    inp = Input(shape=(784,))
+    x = layers.Dense(128, activation="relu")(inp)
+    x = layers.Dense(32, activation="relu")(x)
+    z = layers.Dense(latent_dim, activation="relu", name="latent")(x)
+    x = layers.Dense(32, activation="relu")(z)
+    x = layers.Dense(128, activation="relu")(x)
+    out = layers.Dense(784, activation="sigmoid")(x)
+
+    autoencoder = Model(inp, out, name="fc_autoencoder")
+    encoder = Model(inp, z, name="fc_encoder")
+    autoencoder.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss="binary_crossentropy")
+    return autoencoder, encoder
+
+fc_ae, fc_encoder = build_fc_autoencoder()
+fc_ae.summary()
+
+
+# Task: 3. Fully Connected Autoencoder - Train
+
+EPOCHS_FC = 20
+BATCH_SIZE = 128
+
+start = time.time()
+fc_history = fc_ae.fit(x_train_f, x_train_f, validation_data=(x_test_f, x_test_f),
+                        epochs=EPOCHS_FC, batch_size=BATCH_SIZE, verbose=1)
+fc_train_time = time.time() - start
+print(f"FC-AE training time: {fc_train_time:.2f} s")
+
+
+# Task: 4. Plot 1 — Original vs. Reconstructed Images (FC-AE)
+
+def plot_original_vs_reconstructed(originals, reconstructions, n=10, title="Original vs Reconstruction"):
+    fig, axes = plt.subplots(2, n, figsize=(n * 1.2, 3))
+    for i in range(n):
+        axes[0, i].imshow(originals[i].reshape(28, 28), cmap="gray")
+        axes[0, i].axis("off")
+        axes[1, i].imshow(reconstructions[i].reshape(28, 28), cmap="gray")
+        axes[1, i].axis("off")
+    axes[0, 0].set_ylabel("Original", fontsize=10)
+    axes[1, 0].set_ylabel("Reconstructed", fontsize=10)
+    fig.suptitle(title)
+    plt.tight_layout()
+    return fig
+
+fc_recon = fc_ae.predict(x_test_f[:10], verbose=0)
+fig = plot_original_vs_reconstructed(x_test_f[:10], fc_recon, n=10, title="FC-AE: Original vs Reconstruction")
+plt.savefig("plot1_fc_original_vs_recon.png", dpi=150)
+plt.show()
+
+
+# Task: 5. Plot 2 — FC-AE Training and Validation Loss
+
+plt.figure(figsize=(6, 4))
+plt.plot(fc_history.history["loss"], label="Train Loss")
+plt.plot(fc_history.history["val_loss"], label="Val Loss")
+plt.xlabel("Epoch"); plt.ylabel("Reconstruction Loss (BCE)")
+plt.title("FC-AE Training/Validation Loss")
+plt.legend()
+plt.tight_layout()
+plt.savefig("plot2_fc_loss_curve.png", dpi=150)
+plt.show()
+
+
+# Task: 6. Reconstruction Metrics (MSE, MAE, SSIM)
+
+def compute_metrics(originals, reconstructions):
+    # originals, reconstructions: (N, 28, 28) or (N, 784) in [0,1]
+    o = originals.reshape(-1, 28, 28)
+    r = reconstructions.reshape(-1, 28, 28)
+    mse = np.mean((o - r) ** 2)
+    mae = np.mean(np.abs(o - r))
+    ssim_vals = [ssim_fn(o[i], r[i], data_range=1.0) for i in range(len(o))]
+    mean_ssim = np.mean(ssim_vals)
+    return mse, mae, mean_ssim, np.array(ssim_vals)
+
+fc_test_recon = fc_ae.predict(x_test_f, verbose=0)
+fc_mse, fc_mae, fc_ssim, fc_ssim_all = compute_metrics(x_test_f, fc_test_recon)
+
+print("Fully Connected Autoencoder — Test Set Metrics")
+print(f"Test MSE  : {fc_mse:.6f}")
+print(f"Test MAE  : {fc_mae:.6f}")
+print(f"Mean SSIM : {fc_ssim:.4f}")
+
+
+# Task: 7. Convolutional Autoencoder — Build
+
+def build_conv_autoencoder():
+    inp = Input(shape=(28, 28, 1))
+    x = layers.Conv2D(32, 3, activation="relu", padding="same")(inp)
+    x = layers.MaxPooling2D(2, padding="same")(x)
+    x = layers.Conv2D(64, 3, activation="relu", padding="same")(x)
+    encoded = layers.MaxPooling2D(2, padding="same", name="latent_feature_map")(x)
+
+    x = layers.Conv2D(64, 3, activation="relu", padding="same")(encoded)
+    x = layers.UpSampling2D(2)(x)
+    x = layers.Conv2D(32, 3, activation="relu", padding="same")(x)
+    x = layers.UpSampling2D(2)(x)
+    out = layers.Conv2D(1, 3, activation="sigmoid", padding="same")(x)
+
+    autoencoder = Model(inp, out, name="conv_autoencoder")
+    encoder = Model(inp, encoded, name="conv_encoder")
+    autoencoder.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss="binary_crossentropy")
+    return autoencoder, encoder
+
+conv_ae, conv_encoder = build_conv_autoencoder()
+conv_ae.summary()
+
+
+# Task: 8. Convolutional Autoencoder — Train
+
+start = time.time()
+conv_history = conv_ae.fit(x_train_c, x_train_c, validation_data=(x_test_c, x_test_c),
+                            epochs=EPOCHS_FC, batch_size=BATCH_SIZE, verbose=1)
+conv_train_time = time.time() - start
+print(f"Conv-AE training time: {conv_train_time:.2f} s")
+
+
+# Task: 9. Comparing Fully Connected and Convolutional Autoencoders
+
+conv_test_recon = conv_ae.predict(x_test_c, verbose=0)
+conv_mse, conv_mae, conv_ssim, conv_ssim_all = compute_metrics(x_test_c, conv_test_recon)
+
+comparison_fc_conv = pd.DataFrame({
+    "Fully Connected AE": {"MSE": fc_mse, "MAE": fc_mae, "SSIM": fc_ssim, "Parameters": fc_ae.count_params()},
+    "Convolutional AE": {"MSE": conv_mse, "MAE": conv_mae, "SSIM": conv_ssim, "Parameters": conv_ae.count_params()},
+}).T
+print(comparison_fc_conv)
+
+# Plot 3: Original -> FC-AE Reconstruction -> CAE Reconstruction
+n = 10
+fig, axes = plt.subplots(3, n, figsize=(n * 1.2, 4.5))
+for i in range(n):
+    axes[0, i].imshow(x_test[i], cmap="gray"); axes[0, i].axis("off")
+    axes[1, i].imshow(fc_test_recon[i].reshape(28, 28), cmap="gray"); axes[1, i].axis("off")
+    axes[2, i].imshow(conv_test_recon[i].reshape(28, 28), cmap="gray"); axes[2, i].axis("off")
+axes[0, 0].set_title("Original", loc="left", fontsize=9)
+fig.text(0.01, 0.78, "Original", va="center", rotation=90, fontsize=10)
+fig.text(0.01, 0.5, "FC-AE", va="center", rotation=90, fontsize=10)
+fig.text(0.01, 0.2, "CAE", va="center", rotation=90, fontsize=10)
+plt.tight_layout()
+plt.savefig("plot3_fc_vs_cae_reconstruction.png", dpi=150)
+plt.show()
+
+
+# Task: 10. Adding Image Noise (Gaussian and Salt-and-Pepper)
+
+def add_gaussian_noise(images, sigma):
+    noisy = images + np.random.normal(0, sigma, images.shape).astype("float32")
+    return np.clip(noisy, 0.0, 1.0)
+
+def add_salt_pepper_noise(images, p):
+    noisy = images.copy()
+    mask = np.random.rand(*images.shape)
+    noisy[mask < p / 2] = 0.0
+    noisy[(mask >= p / 2) & (mask < p)] = 1.0
+    return noisy
+
+# Visualize both corruption types on a few samples
+sample_imgs = x_test_c[:5]
+gauss_example = add_gaussian_noise(sample_imgs, sigma=0.2)
+sp_example = add_salt_pepper_noise(sample_imgs, p=0.10)
+
+fig, axes = plt.subplots(3, 5, figsize=(8, 5))
+for i in range(5):
+    axes[0, i].imshow(sample_imgs[i, :, :, 0], cmap="gray"); axes[0, i].axis("off")
+    axes[1, i].imshow(gauss_example[i, :, :, 0], cmap="gray"); axes[1, i].axis("off")
+    axes[2, i].imshow(sp_example[i, :, :, 0], cmap="gray"); axes[2, i].axis("off")
+fig.text(0.02, 0.83, "Clean", va="center", rotation=90)
+fig.text(0.02, 0.5, "Gaussian ($\\sigma$=0.2)", va="center", rotation=90)
+fig.text(0.02, 0.17, "Salt & Pepper (p=0.10)", va="center", rotation=90)
+plt.tight_layout()
+plt.savefig("noise_types_example.png", dpi=150)
+plt.show()
+
+
+# Task: 11. Denoising Convolutional Autoencoder — Build and Train
+
+NOISE_SIGMA_TRAIN = 0.2
+
+x_train_noisy = add_gaussian_noise(x_train_c, sigma=NOISE_SIGMA_TRAIN)
+x_test_noisy = add_gaussian_noise(x_test_c, sigma=NOISE_SIGMA_TRAIN)
+
+denoise_ae, denoise_encoder = build_conv_autoencoder()
+
+start = time.time()
+denoise_history = denoise_ae.fit(
+    x_train_noisy, x_train_c,  # noisy input, clean target
+    validation_data=(x_test_noisy, x_test_c),
+    epochs=EPOCHS_FC, batch_size=BATCH_SIZE, verbose=1
+)
+denoise_train_time = time.time() - start
+print(f"Denoising CAE training time: {denoise_train_time:.2f} s")
+
+
+# Task: 12. Plot 4 — Clean vs. Noisy vs. Denoised
+
+denoised_test = denoise_ae.predict(x_test_noisy[:10], verbose=0)
+
+n = 10
+fig, axes = plt.subplots(3, n, figsize=(n * 1.2, 4.5))
+for i in range(n):
+    axes[0, i].imshow(x_test_c[i, :, :, 0], cmap="gray"); axes[0, i].axis("off")
+    axes[1, i].imshow(x_test_noisy[i, :, :, 0], cmap="gray"); axes[1, i].axis("off")
+    axes[2, i].imshow(denoised_test[i, :, :, 0], cmap="gray"); axes[2, i].axis("off")
+fig.text(0.01, 0.8, "Clean", va="center", rotation=90)
+fig.text(0.01, 0.5, "Noisy", va="center", rotation=90)
+fig.text(0.01, 0.18, "Denoised", va="center", rotation=90)
+plt.tight_layout()
+plt.savefig("plot4_clean_noisy_denoised.png", dpi=150)
+plt.show()
+
+
+# Task: 13. Plot 5 — Noise Level vs. Reconstruction Quality
+
+noise_levels = [0.1, 0.2, 0.3]
+noise_results = []
+
+for sigma in noise_levels:
+    x_test_noisy_s = add_gaussian_noise(x_test_c, sigma=sigma)
+    denoised_s = denoise_ae.predict(x_test_noisy_s, verbose=0)
+    mse_s, mae_s, ssim_s, _ = compute_metrics(x_test_c, denoised_s)
+    noise_results.append({"Noise Level": sigma, "MSE": mse_s, "MAE": mae_s, "SSIM": ssim_s})
+    print(f"sigma={sigma}: MSE={mse_s:.6f}  MAE={mae_s:.6f}  SSIM={ssim_s:.4f}")
+
+noise_df = pd.DataFrame(noise_results).set_index("Noise Level")
+print("\n", noise_df)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+axes[0].plot(noise_df.index, noise_df["MSE"], marker="o"); axes[0].set_title("Noise Level vs MSE"); axes[0].set_xlabel("sigma"); axes[0].set_ylabel("MSE")
+axes[1].plot(noise_df.index, noise_df["MAE"], marker="o", color="orange"); axes[1].set_title("Noise Level vs MAE"); axes[1].set_xlabel("sigma"); axes[1].set_ylabel("MAE")
+axes[2].plot(noise_df.index, noise_df["SSIM"], marker="o", color="green"); axes[2].set_title("Noise Level vs SSIM"); axes[2].set_xlabel("sigma"); axes[2].set_ylabel("SSIM")
+plt.tight_layout()
+plt.savefig("plot5_noise_level_vs_quality.png", dpi=150)
+plt.show()
+
+
+# Task: 14. Variational Autoencoder (VAE) — Build
+LATENT_DIM_VAE = 2
+
+class Sampling(layers.Layer):
+    def call(self, inputs):
+        z_mean, z_log_var = inputs
+        batch = tf.shape(z_mean)[0]
+        dim = tf.shape(z_mean)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+# Encoder
+vae_inp = Input(shape=(28, 28, 1))
+x = layers.Conv2D(32, 3, activation="relu", strides=2, padding="same")(vae_inp)
+x = layers.Conv2D(64, 3, activation="relu", strides=2, padding="same")(x)
+conv_shape_before_flatten = x.shape[1:]
+x = layers.Flatten()(x)
+x = layers.Dense(32, activation="relu")(x)
+z_mean = layers.Dense(LATENT_DIM_VAE, name="z_mean")(x)
+z_log_var = layers.Dense(LATENT_DIM_VAE, name="z_log_var")(x)
+z = Sampling()([z_mean, z_log_var])
+vae_encoder = Model(vae_inp, [z_mean, z_log_var, z], name="vae_encoder")
+vae_encoder.summary()
+
+# Decoder
+latent_inp = Input(shape=(LATENT_DIM_VAE,))
+x = layers.Dense(int(np.prod(conv_shape_before_flatten)), activation="relu")(latent_inp)
+x = layers.Reshape(conv_shape_before_flatten)(x)
+x = layers.Conv2DTranspose(64, 3, activation="relu", strides=2, padding="same")(x)
+x = layers.Conv2DTranspose(32, 3, activation="relu", strides=2, padding="same")(x)
+vae_out = layers.Conv2DTranspose(1, 3, activation="sigmoid", padding="same")(x)
+vae_decoder = Model(latent_inp, vae_out, name="vae_decoder")
+vae_decoder.summary()
+
+class VAE(Model):
+    def __init__(self, encoder, decoder, **kwargs):
+        super().__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
+        self.recon_loss_tracker = tf.keras.metrics.Mean(name="recon_loss")
+        self.kl_loss_tracker = tf.keras.metrics.Mean(name="kl_loss")
+
+    @property
+    def metrics(self):
+        return [self.total_loss_tracker, self.recon_loss_tracker, self.kl_loss_tracker]
+
+    def train_step(self, data):
+        if isinstance(data, tuple):
+            data = data[0]
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, z = self.encoder(data)
+            reconstruction = self.decoder(z)
+            recon_loss = tf.reduce_mean(
+                tf.reduce_sum(tf.keras.losses.binary_crossentropy(data, reconstruction), axis=(1, 2))
+            )
+            kl_loss = -0.5 * tf.reduce_mean(
+                tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=1)
+            )
+            total_loss = recon_loss + kl_loss
+        grads = tape.gradient(total_loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        self.total_loss_tracker.update_state(total_loss)
+        self.recon_loss_tracker.update_state(recon_loss)
+        self.kl_loss_tracker.update_state(kl_loss)
+        return {m.name: m.result() for m in self.metrics}
+
+    def test_step(self, data):
+        if isinstance(data, tuple):
+            data = data[0]
+        z_mean, z_log_var, z = self.encoder(data)
+        reconstruction = self.decoder(z)
+        recon_loss = tf.reduce_mean(
+            tf.reduce_sum(tf.keras.losses.binary_crossentropy(data, reconstruction), axis=(1, 2))
+        )
+        kl_loss = -0.5 * tf.reduce_mean(
+            tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=1)
+        )
+        total_loss = recon_loss + kl_loss
+        self.total_loss_tracker.update_state(total_loss)
+        self.recon_loss_tracker.update_state(recon_loss)
+        self.kl_loss_tracker.update_state(kl_loss)
+        return {m.name: m.result() for m in self.metrics}
+
+vae = VAE(vae_encoder, vae_decoder)
+vae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3))
+
+
+# Task: 15. VAE — Train
+
+EPOCHS_VAE = 30
+
+start = time.time()
+vae_history = vae.fit(x_train_c, x_train_c, validation_data=(x_test_c, x_test_c),
+                       epochs=EPOCHS_VAE, batch_size=BATCH_SIZE, verbose=1)
+vae_train_time = time.time() - start
+print(f"VAE training time: {vae_train_time:.2f} s")
+
+
+# Task: 16. VAE Training/Validation Loss Curve
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+axes[0].plot(vae_history.history["loss"], label="Train"); axes[0].plot(vae_history.history["val_loss"], label="Val")
+axes[0].set_title("Total Loss"); axes[0].set_xlabel("Epoch"); axes[0].legend()
+axes[1].plot(vae_history.history["recon_loss"], label="Train"); axes[1].plot(vae_history.history["val_recon_loss"], label="Val")
+axes[1].set_title("Reconstruction Loss"); axes[1].set_xlabel("Epoch"); axes[1].legend()
+axes[2].plot(vae_history.history["kl_loss"], label="Train"); axes[2].plot(vae_history.history["val_kl_loss"], label="Val")
+axes[2].set_title("KL Divergence Loss"); axes[2].set_xlabel("Epoch"); axes[2].legend()
+plt.tight_layout()
+plt.savefig("plot9_vae_loss_curve.png", dpi=150)
+plt.show()
+
+print(f"Final VAE — Train total: {vae_history.history['loss'][-1]:.2f}  "
+      f"Val total: {vae_history.history['val_loss'][-1]:.2f}  "
+      f"Train recon: {vae_history.history['recon_loss'][-1]:.2f}  "
+      f"Train KL: {vae_history.history['kl_loss'][-1]:.2f}")
+
+
+# Task: 17. Plot 6 — VAE Latent Space Visualization
+
+z_mean_test, _, _ = vae_encoder.predict(x_test_c, verbose=0)
+
+plt.figure(figsize=(7, 6))
+scatter = plt.scatter(z_mean_test[:, 0], z_mean_test[:, 1], c=y_test, cmap="tab10", s=8, alpha=0.7)
+plt.colorbar(scatter, label="Digit label")
+plt.xlabel("z1"); plt.ylabel("z2")
+plt.title("VAE Latent Space (test set, colored by digit label)")
+plt.tight_layout()
+plt.savefig("plot6_vae_latent_space.png", dpi=150)
+plt.show()
+
+
+# Task: 18. Plot 7 — Randomly Generated VAE Images
+
+N_GEN = 25
+rng_gen = np.random.RandomState(SEED)
+random_latents = rng_gen.normal(size=(N_GEN, LATENT_DIM_VAE)).astype("float32")
+generated_imgs = vae_decoder.predict(random_latents, verbose=0)
+
+grid_size = 5
+fig, axes = plt.subplots(grid_size, grid_size, figsize=(6, 6))
+for i, ax in enumerate(axes.flat):
+    ax.imshow(generated_imgs[i, :, :, 0], cmap="gray")
+    ax.axis("off")
+plt.suptitle("Randomly Generated VAE Samples (z ~ N(0, I))")
+plt.tight_layout()
+plt.savefig("plot7_vae_generated_samples.png", dpi=150)
+plt.show()
+
+
+# Task: 19. Plot 8 — Latent Space Interpolation
+
+# Pick two test images from different digit classes for interpolation
+idx_a = np.where(y_test == 3)[0][0]
+idx_b = np.where(y_test == 8)[0][0]
+
+z_a, _, _ = vae_encoder.predict(x_test_c[idx_a:idx_a+1], verbose=0)
+z_b, _, _ = vae_encoder.predict(x_test_c[idx_b:idx_b+1], verbose=0)
+
+alphas = np.arange(0, 1.01, 0.1)
+z_interp = np.array([(1 - a) * z_a[0] + a * z_b[0] for a in alphas])
+decoded_interp = vae_decoder.predict(z_interp, verbose=0)
+
+fig, axes = plt.subplots(1, len(alphas), figsize=(len(alphas) * 1.2, 1.6))
+for i, ax in enumerate(axes):
+    ax.imshow(decoded_interp[i, :, :, 0], cmap="gray")
+    ax.set_title(f"{alphas[i]:.1f}", fontsize=8)
+    ax.axis("off")
+plt.suptitle(f"Latent Space Interpolation: digit {y_test[idx_a]} -> digit {y_test[idx_b]}")
+plt.tight_layout()
+plt.savefig("plot8_vae_interpolation.png", dpi=150)
+plt.show()
+
+
+# Task: 20. Reconstruction Comparison Across Models
+_, _, z_test = vae_encoder.predict(x_test_c, verbose=0)
+vae_recon_test = vae_decoder.predict(z_test, verbose=0)
+vae_mse, vae_mae, vae_ssim, vae_ssim_all = compute_metrics(x_test_c, vae_recon_test)
+
+denoised_full = denoise_ae.predict(x_test_noisy, verbose=0)
+denoise_mse, denoise_mae, denoise_ssim, denoise_ssim_all = compute_metrics(x_test_c, denoised_full)
+
+recon_comparison = pd.DataFrame({
+    "Fully Connected AE": {"MSE": fc_mse, "MAE": fc_mae, "SSIM": fc_ssim, "Parameters": fc_ae.count_params()},
+    "Convolutional AE": {"MSE": conv_mse, "MAE": conv_mae, "SSIM": conv_ssim, "Parameters": conv_ae.count_params()},
+    "Denoising CAE": {"MSE": denoise_mse, "MAE": denoise_mae, "SSIM": denoise_ssim, "Parameters": denoise_ae.count_params()},
+}).T
+print("Reconstruction-based models:\n", recon_comparison)
+
+vae_metrics = pd.DataFrame({
+    "VAE Metric": ["Reconstruction Loss", "KL Loss", "Total Loss", "Test MSE", "Test MAE", "Mean SSIM"],
+    "Value": [vae_history.history["val_recon_loss"][-1], vae_history.history["val_kl_loss"][-1],
+              vae_history.history["val_loss"][-1], vae_mse, vae_mae, vae_ssim]
+})
+print("\nVAE (reported separately due to KL term):\n", vae_metrics)
+
+
+# Task: 21. Plot 9 — Reconstruction Error Distribution (Test Set)
+
+# Using the Convolutional Autoencoder as the reference reconstruction-based model
+per_image_error = np.mean((x_test_c.reshape(-1, 784) - conv_test_recon.reshape(-1, 784)) ** 2, axis=1)
+
+plt.figure(figsize=(7, 5))
+plt.hist(per_image_error, bins=40, color="steelblue", edgecolor="black")
+plt.xlabel("Per-image Reconstruction Error (MSE)")
+plt.ylabel("Number of Images")
+plt.title("Distribution of Reconstruction Errors — Convolutional AE (Test Set)")
+plt.tight_layout()
+plt.savefig("plot10_reconstruction_error_distribution.png", dpi=150)
+plt.show()
+
+print(f"Error range: [{per_image_error.min():.6f}, {per_image_error.max():.6f}]")
+print(f"Mean: {per_image_error.mean():.6f}  Median: {np.median(per_image_error):.6f}  Std: {per_image_error.std():.6f}")
+
+
+# Task: 22. Required High-Error Image Analysis (Top-5)
+
+top5_idx = np.argsort(per_image_error)[-5:][::-1]
+
+fig, axes = plt.subplots(2, 5, figsize=(10, 4.5))
+for col, idx in enumerate(top5_idx):
+    axes[0, col].imshow(x_test_c[idx, :, :, 0], cmap="gray"); axes[0, col].axis("off")
+    axes[0, col].set_title(f"Sample {col+1}\n(err={per_image_error[idx]:.4f})", fontsize=8)
+    axes[1, col].imshow(conv_test_recon[idx, :, :, 0], cmap="gray"); axes[1, col].axis("off")
+fig.text(0.02, 0.75, "Original", va="center", rotation=90)
+fig.text(0.02, 0.3, "Reconstruction", va="center", rotation=90)
+plt.tight_layout()
+plt.savefig("high_error_samples.png", dpi=150)
+plt.show()
+
+for col, idx in enumerate(top5_idx):
+    print(f"Sample {col+1}: test index={idx}, true label={y_test[idx]}, error={per_image_error[idx]:.6f}")
+
+
+# Task: 23. Consolidated Results
+
+consolidated = pd.DataFrame({
+    "FC Autoencoder": {"MSE": fc_mse, "MAE": fc_mae, "SSIM": fc_ssim,
+                        "Parameters": fc_ae.count_params(), "Time (s)": fc_train_time},
+    "Conv. Autoencoder": {"MSE": conv_mse, "MAE": conv_mae, "SSIM": conv_ssim,
+                           "Parameters": conv_ae.count_params(), "Time (s)": conv_train_time},
+    "Denoising CAE": {"MSE": denoise_mse, "MAE": denoise_mae, "SSIM": denoise_ssim,
+                       "Parameters": denoise_ae.count_params(), "Time (s)": denoise_train_time},
+    "VAE": {"MSE": vae_mse, "MAE": vae_mae, "SSIM": vae_ssim,
+            "Parameters": vae.encoder.count_params() + vae.decoder.count_params(), "Time (s)": vae_train_time},
+}).T
+print(consolidated)
+
+
+# Task: 24. Additional Latent-Dimension Study
+
+latent_dims = [2, 8, 16, 32]
+latent_study_results = []
+
+for dz in latent_dims:
+    ae, enc = build_fc_autoencoder(latent_dim=dz)
+    ae.fit(x_train_f, x_train_f, validation_data=(x_test_f, x_test_f),
+           epochs=15, batch_size=BATCH_SIZE, verbose=0)
+    recon = ae.predict(x_test_f, verbose=0)
+    mse_dz, mae_dz, ssim_dz, _ = compute_metrics(x_test_f, recon)
+    latent_study_results.append({"Latent Dimension": dz, "MSE": mse_dz, "SSIM": ssim_dz,
+                                  "Parameters": ae.count_params()})
+    print(f"dz={dz:3d}  MSE={mse_dz:.6f}  SSIM={ssim_dz:.4f}  Params={ae.count_params()}")
+
+latent_df = pd.DataFrame(latent_study_results).set_index("Latent Dimension")
+print("\n", latent_df)
+
+plt.figure(figsize=(7, 5))
+plt.plot(latent_df.index, latent_df["MSE"], marker="o")
+plt.xlabel("Latent Dimension"); plt.ylabel("Test MSE")
+plt.title("Plot 10: Latent Dimension vs Reconstruction MSE")
+plt.xscale("log", base=2)
+plt.tight_layout()
+plt.savefig("plot10b_latent_dim_vs_mse.png", dpi=150)
+plt.show()
