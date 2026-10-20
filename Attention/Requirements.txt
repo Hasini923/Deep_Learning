@@ -1,8 +1,6 @@
-# Tested on Google Colab (T4 GPU): TensorFlow 2.21.0 / Keras 3.13.2
-tensorflow>=2.16,<3
-numpy
-pandas
-matplotlib
-seaborn
-scikit-learn
-scipy
+tensorflow>=2.16.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
